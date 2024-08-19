@@ -1,0 +1,84 @@
+import asyncio
+import aiohttp
+from aiohttp import web
+import logging
+import ssl
+from aiohttp.web_middlewares import middleware
+import time
+
+# Configuration
+PORT = 8080
+ALLOWED_DOMAINS = []  # Leave empty to allow all
+BLOCKED_DOMAINS = []
+LOG_FILE = "proxy.log"
+CACHE_TTL = 60  # Cache time-to-live in seconds
+
+# Setup logging
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# SSL Context for HTTPS requests
+ssl_context = ssl.create_default_context()
+
+# In-memory cache
+cache = {}
+
+@middleware
+async def caching_middleware(request, handler):
+    url = str(request.url)
+    if url in cache:
+        cached_response, timestamp = cache[url]
+        if time.time() - timestamp < CACHE_TTL:
+            return web.Response(body=cached_response['body'], headers=cached_response['headers'], status=cached_response['status'])
+        else:
+            del cache[url]
+    response = await handler(request)
+    if response.status == 200:
+        cache[url] = {
+            'body': response.body,
+            'headers': response.headers,
+            'status': response.status
+        }, time.time()
+    return response
+
+async def handle_request(request):
+    url = str(request.url)[len(f"http://{request.host}"):]  # Remove proxy server part of the URL
+    parsed_url = urlparse(url)
+
+    if not parsed_url.scheme:
+        return web.Response(status=400, text="Invalid URL scheme.")
+
+    # Access control: domain whitelisting/blacklisting
+    domain = parsed_url.netloc
+    if ALLOWED_DOMAINS and not any(allowed in domain for allowed in ALLOWED_DOMAINS):
+        logging.warning(f"Blocked access to {url} - Domain not allowed")
+        return web.Response(status=403, text="Access Denied: Domain not allowed.")
+
+    if BLOCKED_DOMAINS and any(blocked in domain for blocked in BLOCKED_DOMAINS):
+        logging.warning(f"Blocked access to {url} - Domain is blocked")
+        return web.Response(status=403, text="Access Denied: Domain is blocked.")
+
+    # Forward headers, excluding the host header
+    headers = {key: value for key, value in request.headers.items() if key.lower() != "host"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                data=await request.read(),
+                ssl=ssl_context if parsed_url.scheme == "https" else None
+            ) as resp:
+                body = await resp.read()
+                logging.info(f"{request.method} {url} - {resp.status}")
+                return web.Response(status=resp.status, headers=resp.headers, body=body)
+    except Exception as e:
+        logging.error(f"Error handling request for {url}: {e}")
+        return web.Response(status=500, text="Internal Server Error")
+
+# Application setup
+app = web.Application(middlewares=[caching_middleware])
+app.router.add_route('*', '/{path:.*}', handle_request)
+
+if __name__ == "__main__":
+    web.run_app(app, port=PORT)
